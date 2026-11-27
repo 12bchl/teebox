@@ -1,0 +1,11 @@
+{
+  "permissions": { "defaultMode": "bypassPermissions" },
+  "skipDangerousModePermissionPrompt": true,
+  "autoMemoryEnabled": false,
+  "feedbackSurveyRate": 0,
+  "spinnerTipsEnabled": false,
+  "env": {
+    "DISABLE_AUTOUPDATER": "1",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  }
+}

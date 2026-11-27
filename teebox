@@ -1,0 +1,497 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+warn() { echo "teebox: $*" >&2; }
+die()  { warn "$@"; exit 1; }
+
+usage() {
+  cat >&2 <<'EOF'
+teebox - run an AI coding agent in a Docker/Podman box with rw access to $PWD only.
+
+Usage:
+  teebox [OPTIONS] [TOPIC] [-- AGENT_ARGS...]
+
+  teebox                          interactive agent in $PWD (or its nearest
+                                  ancestor with .teebox/, if $PWD has none)
+  teebox -a codex                 codex instead of the default agent
+  teebox PROJ-123_some_change    session named TOPIC: resumed if it exists, else
+                                  created; TEEBOX_TOPIC set in the box
+  teebox -n PROJ-123_some_change same, but delete the existing session first
+  teebox -- -p "do a thing"       one-shot (agent's own flags)
+  teebox --shell -- 'cmd'         run one shell command in the box
+
+Settings (also keys in ~/.config/teebox/config.toml; defaults: config/defaults.toml).
+Value flags take `--key VAL` or `--key=VAL`; list flags are repeatable and add
+to the config list; switches take `--key` or `--key=false`.
+  -a, --agent NAME       claude, codex, gemini, copilot, opencode, pi, or [agents.NAME]
+  --engine NAME          docker or podman (default: autodetect)
+  --image NAME           image base name
+  --name NAME            container name; {dir} {topic} {hash} = template, probed _2.._99 while taken;
+                         empty after rendering = teebox-<random6>
+  --volume NAME          home volume; same placeholders ({dir} = project root dirname, else "home")
+  --home DIR             host home overlay dir
+  --go-version VER       Go baked into the image
+  --ro PATH              read-only include at /refs/<basename> (list)
+  -e, --env KEY=VAL      env var in the box (list)
+  --pass-env NAME        host env var forwarded by name (list)
+  --add-host NAME:ADDR   extra /etc/hosts entry (list)
+  --device DEV           host device present at start: /dev path or bare name (list)
+  --docker-host[=URL]    engine socket: host $DOCKER_HOST / engine default, or unix:///path
+  --ssh-agent[=PATH]     ssh-agent socket: host $SSH_AUTH_SOCK, or PATH
+
+Per run only:
+  -d, --dir DIR          workspace = DIR instead of $PWD; no .teebox/ search
+  -n, --new              delete TOPIC's existing session, start it fresh
+  --shell                bash instead of the agent
+  --seed                 re-apply the host home overlay over the home volume
+  --build                rebuild the image (refreshes a "latest" agent)
+  --allow-home           allow $PWD = $HOME, an ancestor, or a system root
+  --dry-run              print the engine command and exit
+  -h, --help             this help
+
+Everything after `--` goes to the agent verbatim (with --shell: one bash -c
+command). Details: README.md.
+EOF
+}
+
+# pass-env forwards from this, never from shell variables (IMAGE, TOPIC, ... are the wrapper's)
+declare -A HOST_ENV=()
+while IFS= read -r -d '' kv; do HOST_ENV[${kv%%=*}]="${kv#*=}"; done < <(env -0)
+
+SCRIPT_DIR="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")"
+CONFIG="$HOME/.config/teebox/config.toml"
+
+VALUE_KEYS=" agent engine image name volume home go-version dir "
+LIST_KEYS=" ro env pass-env add-host device "
+SWITCH_KEYS=" docker-host ssh-agent new shell seed build allow-home dry-run "
+CLI_ONLY=" dir new shell seed build allow-home dry-run "
+AGENT_KEYS=" package version cmd args pass-env env session-new session-resume session-found "
+
+declare -A C=() CLI=()
+AGENT_ARGS=()
+TOPIC=""
+while [ $# -gt 0 ]; do
+  a="$1"; shift
+  case "$a" in
+    --)        AGENT_ARGS+=("$@"); break ;;
+    -h|--help) usage; exit 0 ;;
+    -a) a=--agent ;; -d) a=--dir ;; -e) a=--env ;; -n) a=--new ;;
+  esac
+  case "$a" in
+    --*=*) k="${a%%=*}"; k="${k#--}"; v="${a#*=}"; has_v=1 ;;
+    --*)   k="${a#--}"; v=""; has_v=0 ;;
+    -*)    die "unknown flag '$a' (agent flags go after '--')" ;;
+    *)     [ -z "$TOPIC" ] || die "unexpected arg '$a': TOPIC already '$TOPIC' (agent args go after '--')"
+           TOPIC="$a"; continue ;;
+  esac
+  if [[ "$VALUE_KEYS$LIST_KEYS" == *" $k "* ]]; then
+    if [ "$has_v" = 0 ]; then [ $# -gt 0 ] || die "--$k needs a value"; v="$1"; shift; fi
+  elif [[ "$SWITCH_KEYS" == *" $k "* ]]; then
+    [ "$has_v" = 1 ] || v=true
+  else
+    die "unknown flag '--$k' (agent flags go after '--')"
+  fi
+  if [[ "$LIST_KEYS" == *" $k "* ]]; then CLI[$k]+="${CLI[$k]+$'\n'}$v"; else CLI[$k]="$v"; fi
+done
+
+if yq --version 2>/dev/null | grep -q mikefarah; then
+  toml_json() { yq -p toml -o json . "$1"; }
+elif command -v tomlq >/dev/null 2>&1; then
+  toml_json() { tomlq . "$1"; }
+else
+  die "reading TOML needs yq: mikefarah/yq, or python yq's tomlq (apt install yq)"
+fi
+command -v jq >/dev/null 2>&1 || die "needs jq"
+for f in config/defaults.toml Dockerfile; do [ -f "$SCRIPT_DIR/$f" ] || die "missing: $SCRIPT_DIR/$f"; done
+[ -x "$SCRIPT_DIR/entrypoint.sh" ] || die "$SCRIPT_DIR/entrypoint.sh missing or not executable"
+defaults_json="$(toml_json "$SCRIPT_DIR/config/defaults.toml")" \
+  || die "cannot parse config/defaults.toml (needs a yq that reads TOML: mikefarah v4.40+ known good)"
+config_json='{}'
+if [ -f "$CONFIG" ]; then config_json="$(toml_json "$CONFIG")" || die "cannot parse $CONFIG"; fi
+# deep merge, then one "dotted.path<TAB>value" line per scalar; list items end in .N
+cfg_lines="$(printf '%s\n%s\n' "$defaults_json" "$config_json" | jq -rs '
+  reduce .[] as $x ({}; . * $x)
+  | paths(type != "object" and type != "array") as $p
+  | ($p | map(tostring) | join(".")) as $k
+  | getpath($p) | tostring
+  | if test("[\t\n]") then error("\($k): tabs and newlines are not supported") else "\($k)\t\(.)" end')" \
+  || die "cannot merge config ($CONFIG)"
+while IFS=$'\t' read -r k v; do
+  [ -n "$k" ] || continue
+  if [[ "$k" =~ ^(.+)\.[0-9]+$ ]]; then k="${BASH_REMATCH[1]}"; C[$k]+="${C[$k]+$'\n'}$v"; else C[$k]="$v"; fi
+  case "$k" in
+    agents.*.*) f="${k#agents.*.}"; [[ "$AGENT_KEYS" == *" $f "* ]] || die "config: unknown agent key '$k'" ;;
+    *)          [[ "$VALUE_KEYS$LIST_KEYS$SWITCH_KEYS" == *" $k "* && "$CLI_ONLY" != *" $k "* ]] \
+                  || die "config: unknown key '$k'" ;;
+  esac
+done <<< "$cfg_lines"
+[ -f "$CONFIG" ] || [ ! -f "${CONFIG%.toml}" ] || warn "ignoring ${CONFIG%.toml} (bash); settings now live in $CONFIG"
+for k in "${!CLI[@]}"; do
+  if [[ "$LIST_KEYS" == *" $k "* ]]; then C[$k]+="${C[$k]:+$'\n'}${CLI[$k]}"; else C[$k]="${CLI[$k]}"; fi
+done
+
+cfg() { printf '%s' "${C[$1]:-}"; }
+cfg_list() { local -n _out="$2"; _out=(); [ -z "${C[$1]:-}" ] || mapfile -t _out <<< "${C[$1]}"; }
+is_on() {
+  case "${C[$1]:-false}" in
+    true) return 0 ;; false) return 1 ;;
+    *) die "$1: expected true or false, got '${C[$1]}'" ;;
+  esac
+}
+tilde() { case "$1" in "~") printf '%s' "$HOME" ;; "~/"*) printf '%s/%s' "$HOME" "${1#"~/"}" ;; *) printf '%s' "$1" ;; esac; }
+
+for k in new shell seed build allow-home dry-run; do is_on "$k" || true; done
+ENGINE="$(cfg engine)"
+IMAGE_BASE="$(cfg image)"
+HOME_SRC="$(tilde "$(cfg home)")"
+cfg_list ro RO_PATHS
+cfg_list env ENV_PAIRS
+cfg_list pass-env PASS_ENV
+cfg_list add-host ADD_HOSTS
+cfg_list device DEVICES
+
+home_real="$(cd -- "$HOME" 2>/dev/null && pwd -P)" || home_real="$HOME"
+unsafe_ws() {
+  case "$1" in /|/home|/root|/usr|/etc|/var|/bin|/sbin|/lib|/lib64|/boot|/dev|/proc|/sys|/opt|/srv|/mnt|/media) return 0 ;; esac
+  case "$home_real/" in "$1"/*) return 0 ;; esac
+  return 1
+}
+
+if [ -n "$(cfg dir)" ]; then
+  cd -- "$(cfg dir)" 2>/dev/null || die "--dir '$(cfg dir)' is not an accessible directory"
+fi
+# physical path: the host daemon must agree with it for nested -v mounts
+HOST_PWD="$(pwd -P)" || die "cannot resolve current directory"
+
+if [ -z "$(cfg dir)" ] && [ ! -d "$HOST_PWD/.teebox" ]; then
+  d="$HOST_PWD"
+  while [ "$d" != / ]; do
+    d="$(dirname -- "$d")"
+    [ -d "$d/.teebox" ] || continue
+    { unsafe_ws "$d" && ! is_on allow-home; } && break
+    for i in "${!RO_PATHS[@]}"; do
+      case "${RO_PATHS[$i]}" in /*|"~"|"~/"*) ;; *) RO_PATHS[$i]="$HOST_PWD/${RO_PATHS[$i]}" ;; esac
+    done
+    cd -- "$d" || die "cannot enter project root '$d'"
+    warn "workspace: $d (nearest .teebox/; --dir . to stay in $HOST_PWD)"
+    HOST_PWD="$d"
+    break
+  done
+fi
+
+# engine name charset [a-zA-Z0-9][a-zA-Z0-9_.-]*; the prefix supplies the first char
+if [ -d "$HOST_PWD/.teebox" ]; then
+  NAME_SLUG="$(printf '%s' "$(basename -- "$HOST_PWD")" | tr -c 'a-zA-Z0-9_.-' '_')"
+  [ -n "$NAME_SLUG" ] && [ "$NAME_SLUG" != "_" ] || NAME_SLUG=workspace
+else
+  NAME_SLUG=home
+fi
+
+AGENT="$(cfg agent)"
+A="agents.$AGENT"
+if ! [[ "$AGENT" =~ ^[a-z0-9_-]+$ ]] || [ -z "$(cfg "$A.package")" ]; then
+  known="$(printf '%s\n' "${!C[@]}" | sed -n 's/^agents\.\([^.]*\)\.package$/\1/p' | sort | paste -sd' ')"
+  die "unknown agent '$AGENT' (known: $known)"
+fi
+AGENT_PKG="$(cfg "$A.package")"
+AGENT_VERSION="$(cfg "$A.version")"; AGENT_VERSION="${AGENT_VERSION:-latest}"
+AGENT_CMD="$(cfg "$A.cmd")"; AGENT_CMD="${AGENT_CMD:-$AGENT}"
+AGENT_SESSION_FOUND="$(cfg "$A.session-found")"
+cfg_list "$A.args" AGENT_DEFAULT_ARGS
+cfg_list "$A.pass-env" AGENT_PASS_ENV
+cfg_list "$A.env" AGENT_SET_ENV
+cfg_list "$A.session-new" AGENT_SESSION_NEW
+cfg_list "$A.session-resume" AGENT_SESSION_RESUME
+
+declare -A pass_seen=()
+PASS=()
+GO_PASS=()
+for k in "${PASS_ENV[@]}" "${AGENT_PASS_ENV[@]}"; do
+  [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "pass-env '$k' is not a variable name"
+  [ -z "${pass_seen[$k]:-}" ] || continue
+  pass_seen[$k]=1
+  PASS+=("$k")
+  [[ "$k" != GO* ]] || GO_PASS+=("$k")
+done
+
+# one local `go env` call: baked Go version + GO* values incl. `go env -w` settings;
+# from / so no go.mod can trigger a toolchain download
+GO_VERSION="$(cfg go-version)"
+if { [ -z "$GO_VERSION" ] || [ "${#GO_PASS[@]}" -gt 0 ]; } && command -v go >/dev/null 2>&1; then
+  mapfile -t go_vals < <(cd / && GOTOOLCHAIN=local go env GOVERSION "${GO_PASS[@]}" 2>/dev/null) || true
+  if [ "${#go_vals[@]}" -eq $(( 1 + ${#GO_PASS[@]} )) ]; then
+    if [ -z "$GO_VERSION" ]; then
+      GO_VERSION="${go_vals[0]%% *}"
+      case "$GO_VERSION" in go[0-9]*) GO_VERSION="${GO_VERSION#go}" ;; *) GO_VERSION="" ;; esac
+    fi
+    for i in "${!GO_PASS[@]}"; do HOST_ENV[${GO_PASS[$i]}]="${go_vals[$((i + 1))]}"; done
+  fi
+fi
+GO_VERSION="${GO_VERSION:-latest}"
+
+PATH_HASH="$(printf '%s' "$HOST_PWD" | sha256sum | cut -c1-8)"
+TOPIC_SLUG="$(printf '%s' "$TOPIC" | tr -c 'a-zA-Z0-9_.-' '_')"
+# separators left dangling by an empty {topic} are trimmed
+render() {
+  local s="${1//\{dir\}/$NAME_SLUG}"
+  s="${s//\{hash\}/$PATH_HASH}"; s="${s//\{topic\}/$TOPIC_SLUG}"
+  while [[ "$s" == *[_.-] ]]; do s="${s%?}"; done
+  printf '%s' "$s"
+}
+# ./.teebox/ => private volume: its overlay copy is additive and would leak into the
+# shared one. Path hash: dirnames collide, and an existing volume is no clash to probe.
+if [ -n "$(cfg volume)" ]; then
+  HOME_VOL="$(render "$(cfg volume)")"
+elif [ -d "$HOST_PWD/.teebox" ]; then
+  HOME_VOL="$(render 'teebox-home-{dir}-{hash}')"
+else
+  HOME_VOL=teebox-home
+fi
+
+selects_session() {
+  local a
+  for a in "${AGENT_ARGS[@]}"; do
+    case "$a" in
+      -c|--continue|-r|--resume|--resume=*|--session|--session=*|--session-id|--session-id=*|--fork-session|--from-pr*|--teleport*) return 0 ;;
+    esac
+  done
+  return 1
+}
+SESSION_ID=""
+if [ "${#AGENT_SESSION_NEW[@]}" -gt 0 ] && [ -n "$TOPIC" ] && ! is_on shell && ! selects_session; then
+  h="$(printf '%s\0%s' "$HOST_PWD" "$TOPIC" | sha256sum)"
+  SESSION_ID="${h:0:8}-${h:8:4}-5${h:13:3}-8${h:17:3}-${h:20:12}"
+fi
+if is_on new; then
+  [ -n "$TOPIC" ] || die "--new needs a TOPIC (without one every run is a new session)"
+  ! is_on shell || die "--new: --shell starts no session"
+  ! selects_session || die "--new: agent args already pick a session"
+  [ "${#AGENT_SESSION_NEW[@]}" -gt 0 ] || die "--new: agent '$AGENT' has no topic sessions (no session-new)"
+  [ -n "$AGENT_SESSION_FOUND" ] || die "--new: agent '$AGENT' can't clear a session (no session-found)"
+fi
+expand_args() {
+  local a
+  for a; do
+    a="${a//\{id\}/$SESSION_ID}"; a="${a//\{id8\}/${SESSION_ID:0:8}}"
+    a="${a//\{hex\}/${SESSION_ID//-/}}"; a="${a//\{topic\}/$TOPIC}"; a="${a//\{workspace\}/$HOST_PWD}"
+    [ -z "$a" ] || printf '%s\n' "$a"
+  done
+}
+
+! unsafe_ws "$HOST_PWD" || is_on allow-home \
+  || die "refusing workspace '$HOST_PWD': it would rw-expose your home/system to a god-mode agent (--allow-home overrides)"
+
+if [ -z "$ENGINE" ]; then
+  if   command -v docker >/dev/null 2>&1; then ENGINE=docker
+  elif command -v podman >/dev/null 2>&1; then ENGINE=podman
+  else die "no container engine found on PATH (install docker or podman)"
+  fi
+fi
+case "$ENGINE" in docker|podman) ;; *) die "unknown engine '$ENGINE' (use docker or podman)" ;; esac
+is_on dry-run || "$ENGINE" info >/dev/null 2>&1 \
+  || die "'$ENGINE info' failed (docker: daemon running? docker group? podman: rootless subuid/subgid, newuidmap?)"
+
+# false = off, true = the host's own, else a path; resolved before any build
+resolve_sock() {
+  local key="$1" val="$2" inherited="$3" from="$4" path
+  case "$val" in
+    ""|false) return 0 ;;
+    true)     path="$inherited"; [ -n "$path" ] || die "$key=true but host $from is unset" ;;
+    *)        path="$val" ;;
+  esac
+  case "$path" in
+    unix://?*) path="${path#unix://}" ;;
+    /*) ;;
+    *) die "$key -> '$path' unsupported: need a socket path or unix:///path (tcp/ssh can't be mounted)" ;;
+  esac
+  if [ ! -S "$path" ]; then
+    case "$path" in */podman.sock) warn "start it with: systemctl --user enable --now podman.socket" ;; esac
+    die "$key -> '$path' is not a socket (set false to disable)"
+  fi
+  printf '%s' "$path"
+}
+if [ "$ENGINE" = podman ]; then
+  engine_sock="unix://${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
+else
+  engine_sock=unix:///var/run/docker.sock
+fi
+DOCKER_SOCK="$(resolve_sock docker-host "$(tilde "$(cfg docker-host)")" "${DOCKER_HOST:-$engine_sock}" DOCKER_HOST)"
+SSH_AGENT_SOCK="$(resolve_sock ssh-agent "$(tilde "$(cfg ssh-agent)")" "${SSH_AUTH_SOCK:-}" SSH_AUTH_SOCK)"
+
+HOST_UID="$(id -u)"; HOST_GID="$(id -g)"
+# "latest" stays out of the hash: resolving it costs a network call, so only --build does
+AGENT_HASH="$AGENT_PKG"
+[ "$AGENT_VERSION" != latest ] && AGENT_HASH+="@$AGENT_VERSION"
+
+CA_FILE="${NODE_EXTRA_CA_CERTS:-}"
+CA_HASH=""
+if [ -n "$CA_FILE" ]; then
+  [ -r "$CA_FILE" ] || die "NODE_EXTRA_CA_CERTS '$CA_FILE' not readable"
+  CA_HASH="$(sha256sum "$CA_FILE" | cut -c1-12)"
+fi
+BUILD_HASH="$( { cat "$SCRIPT_DIR/Dockerfile"; printf '%s\0' "$GO_VERSION" "$CA_HASH" "$AGENT_HASH"; } | sha256sum | cut -c1-12)"
+BUILD_ARGS=( --build-arg "GO_VERSION=$GO_VERSION" )
+# podman: the Dockerfile's uid 1000, remapped by --userns=keep-id; docker: uid/gid baked per tag
+if [ "$ENGINE" = podman ]; then
+  IMAGE="$IMAGE_BASE:$AGENT-podman-$BUILD_HASH"
+else
+  IMAGE="$IMAGE_BASE:$AGENT-$HOST_UID-$HOST_GID-$BUILD_HASH"
+  BUILD_ARGS+=( --build-arg "UID=$HOST_UID" --build-arg "GID=$HOST_GID" )
+fi
+
+if ! is_on dry-run && { is_on build || ! "$ENGINE" image inspect "$IMAGE" >/dev/null 2>&1; }; then
+  # exact version so an unchanged release is a layer cache hit
+  v="$AGENT_VERSION"
+  if [ "$v" = latest ]; then
+    v="$(curl -fsSL --max-time 5 "https://registry.npmjs.org/$AGENT_PKG/latest" 2>/dev/null | jq -er .version 2>/dev/null)" \
+      || { v=latest; warn "npm registry unreachable; letting the build resolve @latest"; }
+  fi
+  BUILD_ARGS+=( --build-arg "AGENT_PKG=$AGENT_PKG@$v" )
+  warn "building $IMAGE with $AGENT_PKG@$v ($ENGINE) ..."
+  ctx="$(mktemp -d)"
+  mkdir "$ctx/ca"
+  if [ -n "$CA_FILE" ]; then
+    cp -- "$CA_FILE" "$ctx/ca/extra-ca.crt"
+    BUILD_ARGS+=( --build-arg EXTRA_CA=1 )
+  fi
+  rc=0
+  "$ENGINE" build "${BUILD_ARGS[@]}" -t "$IMAGE" -f "$SCRIPT_DIR/Dockerfile" "$ctx" || rc=$?
+  rm -rf -- "$ctx"
+  if [ "$rc" != 0 ]; then
+    [ -n "$CA_FILE" ] \
+      || warn "if that failed on a self-signed certificate, export NODE_EXTRA_CA_CERTS=<your proxy's CA>"
+    die "image build failed"
+  fi
+  "$ENGINE" tag "$IMAGE" "$IMAGE_BASE:$AGENT-latest" || true
+fi
+
+NAME_TPL="$(cfg name)"
+BASE_NAME="$(render "$NAME_TPL")"
+[ -n "$BASE_NAME" ] || BASE_NAME="teebox-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
+CONTAINER_NAME="$BASE_NAME"
+if [[ "$NAME_TPL" == *"{"* ]] && ! is_on dry-run; then
+  n=2
+  while "$ENGINE" container inspect "$CONTAINER_NAME" >/dev/null 2>&1; do
+    [ "$n" -le 99 ] || die "no free container name for '$BASE_NAME' (checked _2.._99)"
+    CONTAINER_NAME="${BASE_NAME}_${n}"
+    n=$((n + 1))
+  done
+fi
+
+ARGS=( run --rm --init --name "$CONTAINER_NAME" -w "$HOST_PWD" -v "$HOST_PWD:$HOST_PWD" )
+if [ -t 0 ] && [ -t 1 ]; then ARGS+=( -it ); else ARGS+=( -i ); fi
+if [ "$ENGINE" = podman ]; then
+  ARGS+=( "--userns=keep-id:uid=1000,gid=1000" )
+else
+  # podman adds the host alias itself
+  ARGS+=( --user "$HOST_UID:$HOST_GID" --add-host=host.docker.internal:host-gateway )
+fi
+for h in "${ADD_HOSTS[@]}"; do
+  case "$h" in ?*:?*) ;; *) die "--add-host '$h' is not NAME:ADDR" ;; esac
+  ARGS+=( --add-host "$h" )
+done
+
+ARGS+=( -e "TEEBOX_AGENT=$AGENT" )
+# claude doesn't reliably export it to Bash-tool shells
+[ "$AGENT" != claude ] || ARGS+=( -e "CLAUDE_PROJECT_DIR=$HOST_PWD" )
+while IFS= read -r pair; do ARGS+=( -e "$pair" ); done < <(expand_args "${AGENT_SET_ENV[@]}")
+[ -n "$TOPIC" ] && ARGS+=( -e "TEEBOX_TOPIC=$TOPIC" )
+
+declare -A seen_canon=() seen_base=()
+for raw in "${RO_PATHS[@]}"; do
+  raw="$(tilde "$raw")"
+  canon="$(readlink -f -- "$raw" 2>/dev/null)" && [ -e "$canon" ] || { warn "--ro '$raw' not found; skipping"; continue; }
+  case "$canon/" in "$HOST_PWD/"*) warn "--ro '$raw' is inside the workspace (already rw); skipping"; continue ;; esac
+  [ -z "${seen_canon[$canon]:-}" ] || continue
+  seen_canon[$canon]=1
+  base="$(basename -- "$canon")"
+  if [ -n "${seen_base[$base]:-}" ]; then
+    base+="-$(printf '%s' "$canon" | sha1sum | cut -c1-6)"
+    warn "basename collision: mounting '$canon' at '/refs/$base'"
+  fi
+  seen_base[$base]=1
+  ARGS+=( -v "$canon:/refs/$base:ro" )
+done
+
+[ -n "${HOST_ENV[TERM]:-}" ] || HOST_ENV[TERM]=xterm-256color
+if [ -n "${pass_seen[TZ]:-}" ] && [ -z "${HOST_ENV[TZ]:-}" ]; then
+  tz="$(readlink -f /etc/localtime 2>/dev/null || true)"
+  case "$tz" in
+    */zoneinfo/*) HOST_ENV[TZ]="${tz#*/zoneinfo/}" ;;
+    *)            [ ! -r /etc/timezone ] || HOST_ENV[TZ]="$(head -n1 /etc/timezone)" ;;
+  esac
+fi
+# name-only -e KEY: token values stay out of the engine argv (ps) and --dry-run
+for k in "${PASS[@]}"; do
+  [ -z "${HOST_ENV[$k]:-}" ] || ARGS+=( -e "$k" )
+done
+for pair in "${ENV_PAIRS[@]}"; do ARGS+=( -e "$pair" ); done
+
+# docker only: host gids are invalid in podman's userns (devices: keep-groups)
+declare -A groupset=()
+if [ -n "$DOCKER_SOCK" ]; then
+  # at its host path, so a nested `-v "$DOCKER_SOCK:..."` names the same file
+  ARGS+=( -v "$DOCKER_SOCK:$DOCKER_SOCK" -e "DOCKER_HOST=unix://$DOCKER_SOCK" )
+  [ "$ENGINE" = podman ] || groupset[$(stat -L -c '%g' "$DOCKER_SOCK")]=1
+fi
+if [ -n "$SSH_AGENT_SOCK" ]; then
+  ARGS+=( -v "$SSH_AGENT_SOCK:/run/ssh-agent.sock" -e "SSH_AUTH_SOCK=/run/ssh-agent.sock" )
+fi
+
+# start-time snapshot: the node under its real name and under the name asked for
+declare -A seen_dev=()
+for d in "${DEVICES[@]}"; do
+  path="$d"
+  case "$d" in
+    /dev/?*) ;;
+    # never relative: a workspace file must not pick a host device
+    */*) die "device '$d': need a /dev/... path or a bare name" ;;
+    *)   for dir in /dev/serial/by-id /dev/serial/by-path /dev; do
+           path="$dir/$d"
+           [ ! -e "$path" ] || break
+         done ;;
+  esac
+  [ -e "$path" ] || { warn "device '$d' not present on host; skipping (plug it in, then re-run)"; continue; }
+  real="$(readlink -f -- "$path")"
+  for p in "$real" "$path"; do
+    [ -z "${seen_dev[$p]:-}" ] || continue
+    seen_dev[$p]=1
+    ARGS+=( --device "$real:$p" )
+  done
+  if [ "$ENGINE" = podman ]; then groupset[keep-groups]=1; else groupset[$(stat -c '%g' "$real")]=1; fi
+done
+for g in "${!groupset[@]}"; do ARGS+=( --group-add "$g" ); done
+
+ARGS+=( -v "$SCRIPT_DIR/entrypoint.sh:/opt/teebox/entrypoint.sh:ro" )
+[ ! -d "$HOME_SRC" ] || ARGS+=( -v "$(realpath -e -- "$HOME_SRC"):/host-home:ro" )
+ARGS+=( -v "$HOME_VOL:/home/agent" "$IMAGE" )
+
+# entrypoint options, up to `--`
+is_on seed && ARGS+=( --seed )
+is_on new && ARGS+=( --new )
+[ "${#AGENT_DEFAULT_ARGS[@]}" -gt 0 ] && ARGS+=( --alias "$AGENT_CMD ${AGENT_DEFAULT_ARGS[*]}" )
+if [ -n "$SESSION_ID" ]; then
+  ARGS+=( --session "$(expand_args "$AGENT_SESSION_FOUND")" "$(expand_args "${AGENT_SESSION_RESUME[@]}")"
+          "$(expand_args "${AGENT_SESSION_NEW[@]}")" )
+fi
+ARGS+=( -- )
+if ! is_on shell; then
+  ARGS+=( "$AGENT_CMD" "${AGENT_DEFAULT_ARGS[@]}" "${AGENT_ARGS[@]}" )
+elif [ "${#AGENT_ARGS[@]}" -gt 0 ]; then
+  ARGS+=( bash -c "${AGENT_ARGS[*]}" )
+else
+  ARGS+=( bash )
+fi
+
+if is_on dry-run; then
+  printf '%s' "$ENGINE"; printf ' %q' "${ARGS[@]}"; printf '\n'
+  if [ -f "$CONFIG" ]; then warn "config: $CONFIG"; else warn "config: none ($CONFIG missing)"; fi
+  exit 0
+fi
+
+# last: restoring a host value may overwrite a wrapper variable of the same name
+set -- "$ENGINE" "${ARGS[@]}"
+for k in "${PASS[@]}"; do
+  [ -z "${HOST_ENV[$k]:-}" ] || export "$k=${HOST_ENV[$k]}"
+done
+exec "$@"

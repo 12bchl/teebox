@@ -1,0 +1,9 @@
+{
+  "general": {
+    "enableAutoUpdate": false,
+    "enableAutoUpdateNotification": false
+  },
+  "privacy": { "usageStatisticsEnabled": false },
+  "security": { "folderTrust": { "enabled": false } },
+  "ui": { "hideTips": true }
+}

@@ -1,0 +1,74 @@
+# Built-in settings. ~/.config/teebox/config.toml is merged over this file:
+# a key you set replaces the default (arrays too). Keys = long CLI flags.
+
+agent = "claude"
+engine = ""                      # "" = autodetect, docker first
+image = "teebox"
+# {dir} = dirname of the project root (nearest dir with .teebox/), else "home";
+# {topic} = TOPIC; {hash} = sha8 of the workspace path
+name = "{topic}"                 # template: _2.._99 tried while taken; empty -> teebox-<random6>
+volume = "teebox-{dir}"          # per project, shared teebox-home outside one; same-named projects share
+home = "~/.config/teebox/home"
+go-version = ""                  # "" = host `go env GOVERSION`, else latest
+ro = []
+env = []
+add-host = []
+device = []                      # /dev path or bare name (by-id, by-path, /dev); present at start
+docker-host = false              # true = host $DOCKER_HOST / engine default, or unix:///path
+ssh-agent = false                # true = host $SSH_AUTH_SOCK, or a path
+pass-env = [
+  "TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "NO_COLOR",
+  "TZ",
+  "GOPRIVATE", "GONOPROXY", "GONOSUMDB", "GOINSECURE",
+]
+
+# Agents. Placeholders: {id} session uuid, {id8} its first 8 chars, {hex} undashed,
+# {topic}, {workspace}. Args expanding to "" are dropped.
+#   package         npm spec (with version: the only build inputs)
+#   version         "" = latest, refreshed by --build; a pin rebuilds by itself
+#   cmd             binary, default = agent name
+#   args            flags always passed (also in the --shell alias); only what a config file can't set
+#   pass-env        host vars forwarded by name (auth)
+#   env             KEY=VAL set in the box
+#   session-new     start session {id}; without session-found = create-or-resume
+#   session-resume  used instead when the $HOME-relative glob session-found matches
+
+[agents.claude]
+package = "@anthropic-ai/claude-code"
+session-new = ["--session-id", "{id}", "--name", "{topic}"]
+session-resume = ["--resume", "{id}"]
+session-found = ".claude/projects/*/{id}.jsonl"
+pass-env = ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"]
+# trusts every workspace; read from process env only, settings.json env has no effect
+env = ["CLAUDE_CODE_SANDBOXED=1"]
+
+[agents.codex]
+package = "@openai/codex"
+pass-env = ["OPENAI_API_KEY", "OPENAI_BASE_URL"]
+
+[agents.gemini]
+package = "@google/gemini-cli"
+args = ["--yolo"]                # no config-file equivalent
+session-new = ["--session-id", "{id}"]
+session-resume = ["--resume", "{id}"]
+session-found = ".gemini/tmp/*/chats/session-*-{id8}.json*"
+pass-env = ["GEMINI_API_KEY", "GOOGLE_API_KEY"]
+
+[agents.copilot]
+package = "@github/copilot"
+args = ["--yolo"]                # no config-file equivalent
+session-new = ["--session-id", "{id}"]
+pass-env = ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]
+
+[agents.opencode]
+package = "@opencode/cli"
+session-new = ["--session", "ses_{hex}"]
+pass-env = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY",
+            "GOOGLE_GENERATIVE_AI_API_KEY", "GOOGLE_API_KEY", "GROQ_API_KEY"]
+
+[agents.pi]
+package = "@earendil-works/pi-coding-agent"
+session-new = ["--session-id", "{id}"]
+pass-env = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY",
+            "XAI_API_KEY", "GROQ_API_KEY"]
+env = ["PI_SKIP_VERSION_CHECK=1"]

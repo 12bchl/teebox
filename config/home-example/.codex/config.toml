@@ -1,0 +1,15 @@
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+# image pins the version; `teebox --build` updates
+check_for_update_on_startup = false
+
+[analytics]
+enabled = false
+
+[notice]
+hide_full_access_warning = true
+
+# folder trust is per project path (no global switch): codex asks once per
+# project and saves it in the volume; pre-trust paths here
+# [projects."/home/you/src/repo"]
+# trust_level = "trusted"
