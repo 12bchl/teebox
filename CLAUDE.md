@@ -9,6 +9,11 @@ source of truth for behaviour.
 
 - `teebox` — bash wrapper: flags + TOML config, mounts, content-hash image tag, engine command.
 - `config/defaults.toml` — every setting's default + built-in `[agents.*]`; the key reference.
+- `completions/teebox.bash`, `completions/_teebox` — bash / native zsh completion. Both
+  parse flags from `teebox --help` (usage line `  [-x, ]--key[ VAL|[=VAL]]  desc`,
+  `(list)` in desc = repeatable: the format they rely on), topics from
+  `teebox --topics`, agents from `[agents.NAME]` headers. Behaviour change -> both.
+- `install.sh` — symlinks `teebox` + login shell's completion; never edits rc files.
 - `Dockerfile` — debian-slim + node 22 + docker CLI + Go/C++/Conan + one agent
   (build-arg `AGENT_PKG`), non-root `agent` user. Build context holds only `ca/` (the
   optional host CA).
@@ -28,7 +33,9 @@ source of truth for behaviour.
 - **A normal run: no network, no state outside the mounts.** Round-trips and
   cache files belong in the `need_build` branch. `latest` is resolved there
   (unchanged release = layer cache hit), hence never in `BUILD_HASH`. No
-  timestamp cache-bust (caused the tag pileup).
+  timestamp cache-bust (caused the tag pileup). Sole host write: a run with a
+  TOPIC appends `workspace<TAB>topic` to `$XDG_STATE_HOME/teebox/topics.tsv`
+  (not under `--dry-run`); `--topics` reads it.
 - **Dockerfile order is cache-tuned:** apt -> CA -> node -> docker CLI ->
   C++/conan -> Go -> agent -> user. Agent bumps invalidate one layer and agents
   share everything above; a uid change rebuilds almost nothing.
@@ -44,12 +51,15 @@ source of truth for behaviour.
   the accepted cost; same-named projects share a volume (user's choice; `{hash}`
   separates them). `volume = ""` = `teebox-home`, or
   `teebox-home-{dir}-{hash}` with a project root. Host-side only.
-- **Host overlay** `~/.config/teebox/home/` mirrors `/home/agent`: bound ro at
+- **Host paths = XDG base dirs** (also macOS): config `$XDG_CONFIG_HOME/teebox/`,
+  state `$XDG_STATE_HOME/teebox/`; unset/relative = `~/.config`, `~/.local/state`.
+  No `~/.teebox/` (collides with the project marker), no `/etc`.
+- **Host overlay** `<config dir>/home/` (`home = ""`) mirrors `/home/agent`: bound ro at
   `/host-home`, copied when the volume lacks `~/.teebox-seeded` or on `--seed`.
   Project tier `./.teebox/home/` applies every start and wins.
 - **Settings = flags = config keys.** One table of keys in the wrapper
   (`VALUE_KEYS` / `LIST_KEYS` / `SWITCH_KEYS`, `CLI_ONLY` for per-run flags);
-  config `~/.config/teebox/config.toml` deep-merges over `config/defaults.toml`, then
+  config `<config dir>/config.toml` deep-merges over `config/defaults.toml`, then
   flags override (lists append). A new setting: add it to the key table,
   `config/defaults.toml`, usage, README. Unknown keys die. No `TEEBOX_*` on the host side.
 - **Config is data, never code.** Host deps: bash 4.4+, jq + either yq flavor
@@ -68,7 +78,7 @@ source of truth for behaviour.
   sha256 of `$HOST_PWD` + TOPIC; keep stable (existing sessions key on it).
 - **Host env is never a setting.** Sanctioned reads: `pass-env` forwarding,
   `NODE_EXTRA_CA_CERTS` (CA), `DOCKER_HOST`/`SSH_AUTH_SOCK` when a socket
-  setting is `true`.
+  setting is `true`, `XDG_CONFIG_HOME`/`XDG_STATE_HOME` (file locations).
 - **Never source anything from the workspace on the host.** Project behaviour
   is selected by *presence* of `./.teebox/`. `./.teebox/init.sh` runs only in
   the box (entrypoint, last before `exec`); the wrapper never reads it.
@@ -109,7 +119,8 @@ source of truth for behaviour.
 ## Verify
 
 ```
-bash -n teebox && sh -n entrypoint.sh
+bash -n teebox && sh -n entrypoint.sh && bash -n install.sh completions/teebox.bash && zsh -n completions/_teebox
+./install.sh --dry-run
 ./teebox --dry-run
 ./teebox --engine podman --dry-run
 ./teebox -a codex --dry-run TOPIC

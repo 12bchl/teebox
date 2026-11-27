@@ -1,5 +1,6 @@
-# Built-in settings. ~/.config/teebox/config.toml is merged over this file:
-# a key you set replaces the default (arrays too). Keys = long CLI flags.
+# Built-in settings. $XDG_CONFIG_HOME/teebox/config.toml (default ~/.config/teebox/)
+# is merged over this file: a key you set replaces the default (arrays too).
+# Keys = long CLI flags.
 
 agent = "claude"
 engine = ""                      # "" = autodetect, docker first
@@ -8,7 +9,7 @@ image = "teebox"
 # {topic} = TOPIC; {hash} = sha8 of the workspace path
 name = "{topic}"                 # template: _2.._99 tried while taken; empty -> teebox-<random6>
 volume = "teebox-{dir}"          # per project, shared teebox-home outside one; same-named projects share
-home = "~/.config/teebox/home"
+home = ""                        # "" = <config dir>/home
 go-version = ""                  # "" = host `go env GOVERSION`, else latest
 ro = []
 env = []

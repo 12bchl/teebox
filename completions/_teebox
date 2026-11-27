@@ -1,0 +1,56 @@
+#compdef teebox
+
+_teebox() {
+  setopt localoptions extendedglob
+  local cmd=${~words[1]} l short long value desc excl action dir expl curcontext=$curcontext state state_descr
+  local -a line specs agents topics pass
+  local -A opt_args
+
+  (( ${words[(I)--]} && ${words[(I)--]} < CURRENT )) && return 1
+
+  # one spec per usage line "  [-x, ]--key[ VAL|[=VAL]]  description"
+  for l in ${(f)"$(_call_program help $cmd --help 2>&1)"}; do
+    [[ $l == (#b)'  '(-([a-z]), |)--([a-z-]##)(' '[A-Z=:]##|)(\[=[A-Z]##\]|)' '#(*) ]] || continue
+    short=$match[2] long=$match[3] value=${${${match[4]# }:l}//:/\\:} desc=${${match[6]//\[/\\[}//\]/\\]}
+    excl="(--$long${short:+ -$short})"
+    [[ $desc == *'(list)'* ]] && excl='*'
+    case $long in
+      agent)    action='->agent' ;;
+      engine)   action='(docker podman)' ;;
+      dir|home) action='_directories' ;;
+      ro|device) action='_files' ;;
+      pass-env) action='_parameters -g "*export*"' ;;
+      *)        action=' ' ;;
+    esac
+    if [[ -n $value ]]; then
+      specs+=("${excl}--${long}=[$desc]:$value:$action")
+      [[ -n $short ]] && specs+=("${excl}-${short}+[$desc]:$value:$action")
+    elif [[ -n $match[5] ]]; then
+      specs+=("${excl}--${long}=-[$desc]:value:(true false)")
+    else
+      specs+=("${excl}--${long}[$desc]")
+      [[ -n $short ]] && specs+=("${excl}-${short}[$desc]")
+    fi
+  done
+
+  _arguments -C $specs '1::topic:->topic' && return 0
+
+  case $state in
+    agent)
+      local bin=${commands[$cmd]:-$cmd} cfg=${XDG_CONFIG_HOME:-}
+      [[ $cfg == /* ]] || cfg=$HOME/.config
+      agents=(${(f)"$(sed -n 's/^[[:space:]]*\[agents\.\([a-z0-9_-]*\)\][[:space:]]*\(#.*\)\{0,1\}$/\1/p' \
+        ${bin:A:h}/config/defaults.toml $cfg/teebox/config.toml 2>/dev/null)"})
+      _wanted agents expl agent compadd - ${(u)agents}
+      ;;
+    topic)
+      dir=${(Q)opt_args[--dir]:-${(Q)opt_args[-d]}}
+      [[ -n $dir ]] && pass+=(--dir ${~dir})
+      (( ${+opt_args[--allow-home]} )) && pass+=(--allow-home)
+      topics=(${(f)"$(_call_program topics $cmd $pass --topics 2>/dev/null)"})
+      _wanted topics expl topic compadd -a topics
+      ;;
+  esac
+}
+
+_teebox "$@"

@@ -6,12 +6,25 @@ whose **only read-write view of the host is the current directory**. Everything
 else on the host is invisible unless added read-only.
 
 ```
+~/src/teebox/install.sh                 # symlinks teebox + completion
 cd ~/some/project
-~/src/teebox/teebox                     # claude (default agent)
-~/src/teebox/teebox -a codex            # codex instead
-~/src/teebox/teebox -- -p "explain"     # args after -- go to the agent
-ln -s ~/src/teebox/teebox ~/.local/bin/teebox
+teebox                                  # claude (default agent)
+teebox -a codex                         # codex instead
+teebox -- -p "explain"                  # args after -- go to the agent
 ```
+
+`install.sh` links `teebox` into the first of `$XDG_BIN_HOME`, `~/.local/bin`,
+`~/bin` on `PATH` (else `~/.local/bin`), plus tab completion (flags, agents,
+and the [topics](#topic-sessions) used in this workspace) for your login shell
+(`$SHELL`; `--shell bash|zsh` to choose):
+
+| Shell | Link | Needs |
+|---|---|---|
+| bash | `teebox` in bash-completion's user dir (`$BASH_COMPLETION_USER_DIR/completions`, else `~/.local/share/bash-completion/completions`) | bash-completion 2.8+; else `source completions/teebox.bash` in `~/.bashrc` |
+| zsh | `_teebox` in a user dir on `$fpath` (`.zsh_functions`, `.zfunc`, `zsh/site-functions`, ... under `$HOME`; never a framework's), else `~/.local/share/zsh/site-functions` | that dir on `fpath` before `compinit` |
+
+It only creates or replaces symlinks, never edits rc files (prints the line to
+add instead), and `--uninstall` removes its links. `--dry-run` shows the plan.
 
 Host: Linux, bash 4.4+, jq, and a TOML reader: [mikefarah/yq](https://github.com/mikefarah/yq)
 v4.40+ (brew, release binary; Ubuntu's apt build 4.30 can't read TOML) or python
@@ -23,9 +36,9 @@ yq's `tomlq` (Debian `apt install yq`).
 teebox [OPTIONS] [TOPIC] [-- AGENT_ARGS...]
 ```
 
-Every setting is both a flag and a key in `~/.config/teebox/config.toml`
-(same name). Value flags: `--key VAL` or `--key=VAL`. List flags repeat and add
-to the config list. Switches: `--key` or `--key=false`.
+Every setting is both a flag and a key in the [config](#config) file
+`~/.config/teebox/config.toml` (same name). Value flags: `--key VAL` or
+`--key=VAL`. List flags repeat and add to the config list. Switches: `--key` or `--key=false`.
 
 | Setting | Effect |
 |---|---|
@@ -34,7 +47,7 @@ to the config list. Switches: `--key` or `--key=false`.
 | `--image NAME` | image base name (`teebox`) |
 | `--name NAME` | container name (default `{topic}`); see [names](#names) |
 | `--volume NAME` | home volume (default `teebox-{dir}`); see [home volume](#home-volume) |
-| `--home DIR` | host home overlay (`~/.config/teebox/home`) |
+| `--home DIR` | host home overlay (default: `home/` in the [config dir](#config)) |
 | `--go-version VER` | Go baked into the image (default: host `go env GOVERSION`, else latest) |
 | `--ro PATH` | read-only include at `/refs/<basename>` (list) |
 | `-e, --env KEY=VAL` | env var in the box (list) |
@@ -55,6 +68,7 @@ Per run only:
 | `--build` | rebuild the image (refreshes a `latest` agent) |
 | `--allow-home` | allow `$PWD` = `$HOME`, an ancestor of it, or a system root |
 | `--dry-run` | print the engine command and the config file read, then exit (no build) |
+| `--topics` | list the TOPICs used in this workspace, then exit (feeds tab completion) |
 | `TOPIC` | at most one: exported as `TEEBOX_TOPIC`, names the [session](#topic-sessions) |
 
 ## Agents
@@ -119,6 +133,11 @@ so `teebox PROJ-123_x` twice = same conversation. Skipped with `--shell`, or
 when the agent args already pick a session (`-c`, `--continue`, `--resume`,
 `--session`, `--session-id`, ...). Claude and gemini write no transcript until
 the first message, so an empty start is created again next time.
+
+Every run with a `TOPIC` (not `--dry-run`) appends `workspace<TAB>topic` to
+`~/.local/state/teebox/topics.tsv` unless already there; `--topics` and tab
+completion list the workspace's entries. Delete lines (or the file) to forget
+topics; sessions are untouched.
 
 `-n`/`--new` starts the topic over: the entrypoint deletes whatever the agent's
 `session-found` glob matches, then starts it as new (same id). Without an
@@ -301,7 +320,17 @@ the engine's error.
 
 ## Config
 
-`~/.config/teebox/config.toml`, deep-merged over the shipped
+Host files follow the XDG base dirs, on macOS too (unset or relative = default):
+
+| Path | Default | Holds |
+|---|---|---|
+| `$XDG_CONFIG_HOME/teebox/` | `~/.config/teebox/` | `config.toml`, `home/` overlay |
+| `$XDG_STATE_HOME/teebox/` | `~/.local/state/teebox/` | `topics.tsv` (topic history) |
+
+No `~/.teebox/`: `.teebox/` marks a [project root](#project-root), so one in
+`$HOME` would make `$HOME` a project. No system-wide (`/etc`) config.
+
+`config.toml` is deep-merged over the shipped
 `config/defaults.toml`, which documents every key: a key you set
 replaces the default, arrays included; an agent table merges key by key.
 Unknown keys fail the run. Values starting `~/` expand to `$HOME`. Flags

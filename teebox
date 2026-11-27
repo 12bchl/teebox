@@ -20,7 +20,8 @@ Usage:
   teebox -- -p "do a thing"       one-shot (agent's own flags)
   teebox --shell -- 'cmd'         run one shell command in the box
 
-Settings (also keys in ~/.config/teebox/config.toml; defaults: config/defaults.toml).
+Settings (also keys in $XDG_CONFIG_HOME/teebox/config.toml, default ~/.config/teebox;
+defaults: config/defaults.toml).
 Value flags take `--key VAL` or `--key=VAL`; list flags are repeatable and add
 to the config list; switches take `--key` or `--key=false`.
   -a, --agent NAME       claude, codex, gemini, copilot, opencode, pi, or [agents.NAME]
@@ -29,7 +30,7 @@ to the config list; switches take `--key` or `--key=false`.
   --name NAME            container name; {dir} {topic} {hash} = template, probed _2.._99 while taken;
                          empty after rendering = teebox-<random6>
   --volume NAME          home volume; same placeholders ({dir} = project root dirname, else "home")
-  --home DIR             host home overlay dir
+  --home DIR             host home overlay dir (default: <config dir>/home)
   --go-version VER       Go baked into the image
   --ro PATH              read-only include at /refs/<basename> (list)
   -e, --env KEY=VAL      env var in the box (list)
@@ -47,6 +48,7 @@ Per run only:
   --build                rebuild the image (refreshes a "latest" agent)
   --allow-home           allow $PWD = $HOME, an ancestor, or a system root
   --dry-run              print the engine command and exit
+  --topics               list TOPICs used in this workspace (shell completion) and exit
   -h, --help             this help
 
 Everything after `--` goes to the agent verbatim (with --shell: one bash -c
@@ -59,12 +61,16 @@ declare -A HOST_ENV=()
 while IFS= read -r -d '' kv; do HOST_ENV[${kv%%=*}]="${kv#*=}"; done < <(env -0)
 
 SCRIPT_DIR="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")"
-CONFIG="$HOME/.config/teebox/config.toml"
+# XDG base dirs, also on macOS; relative values are invalid per spec
+xdg_dir() { case "$1" in /*) printf '%s' "$1" ;; *) printf '%s' "$HOME/$2" ;; esac; }
+CONFIG_DIR="$(xdg_dir "${XDG_CONFIG_HOME:-}" .config)/teebox"
+CONFIG="$CONFIG_DIR/config.toml"
+TOPICS_FILE="$(xdg_dir "${XDG_STATE_HOME:-}" .local/state)/teebox/topics.tsv"
 
 VALUE_KEYS=" agent engine image name volume home go-version dir "
 LIST_KEYS=" ro env pass-env add-host device "
-SWITCH_KEYS=" docker-host ssh-agent new shell seed build allow-home dry-run "
-CLI_ONLY=" dir new shell seed build allow-home dry-run "
+SWITCH_KEYS=" docker-host ssh-agent new shell seed build allow-home dry-run topics "
+CLI_ONLY=" dir new shell seed build allow-home dry-run topics "
 AGENT_KEYS=" package version cmd args pass-env env session-new session-resume session-found "
 
 declare -A C=() CLI=()
@@ -140,10 +146,11 @@ is_on() {
 }
 tilde() { case "$1" in "~") printf '%s' "$HOME" ;; "~/"*) printf '%s/%s' "$HOME" "${1#"~/"}" ;; *) printf '%s' "$1" ;; esac; }
 
-for k in new shell seed build allow-home dry-run; do is_on "$k" || true; done
+for k in new shell seed build allow-home dry-run topics; do is_on "$k" || true; done
 ENGINE="$(cfg engine)"
 IMAGE_BASE="$(cfg image)"
 HOME_SRC="$(tilde "$(cfg home)")"
+HOME_SRC="${HOME_SRC:-$CONFIG_DIR/home}"
 cfg_list ro RO_PATHS
 cfg_list env ENV_PAIRS
 cfg_list pass-env PASS_ENV
@@ -177,6 +184,16 @@ if [ -z "$(cfg dir)" ] && [ ! -d "$HOST_PWD/.teebox" ]; then
     HOST_PWD="$d"
     break
   done
+fi
+
+if is_on topics; then
+  declare -A seen_topic=()
+  [ ! -f "$TOPICS_FILE" ] || while IFS=$'\t' read -r ws t; do
+    [ "$ws" = "$HOST_PWD" ] && [ -z "${seen_topic[$t]:-}" ] || continue
+    seen_topic[$t]=1
+    printf '%s\n' "$t"
+  done < "$TOPICS_FILE"
+  exit 0
 fi
 
 # engine name charset [a-zA-Z0-9][a-zA-Z0-9_.-]*; the prefix supplies the first char
@@ -487,6 +504,13 @@ if is_on dry-run; then
   printf '%s' "$ENGINE"; printf ' %q' "${ARGS[@]}"; printf '\n'
   if [ -f "$CONFIG" ]; then warn "config: $CONFIG"; else warn "config: none ($CONFIG missing)"; fi
   exit 0
+fi
+
+if [ -n "$TOPIC" ] && [[ "$HOST_PWD$TOPIC" != *[$'\t\n']* ]]; then
+  line="$HOST_PWD"$'\t'"$TOPIC"
+  { mkdir -p -- "$(dirname -- "$TOPICS_FILE")" \
+      && { grep -qxF -- "$line" "$TOPICS_FILE" 2>/dev/null || printf '%s\n' "$line" >> "$TOPICS_FILE"; }; } \
+    || warn "cannot record topic in $TOPICS_FILE"
 fi
 
 # last: restoring a host value may overwrite a wrapper variable of the same name
