@@ -310,12 +310,14 @@ case "$ENGINE" in docker|podman) ;; *) die "unknown engine '$ENGINE' (use docker
 is_on dry-run || "$ENGINE" info >/dev/null 2>&1 \
   || die "'$ENGINE info' failed (docker: daemon running? docker group? podman: rootless subuid/subgid, newuidmap?)"
 
-# false = off, true = the host's own, else a path; resolved before any build
+# false = off, true = the host's own, else a path; resolved before any build.
+# optional=1: no live socket -> warn, run without it
 resolve_sock() {
-  local key="$1" val="$2" inherited="$3" from="$4" path
+  local key="$1" val="$2" inherited="$3" from="$4" optional="${5:-0}" path
+  fail() { if [ "$optional" = 1 ]; then warn "$*; running without it"; else die "$@"; fi; }
   case "$val" in
     ""|false) return 0 ;;
-    true)     path="$inherited"; [ -n "$path" ] || die "$key=true but host $from is unset" ;;
+    true)     path="$inherited"; [ -n "$path" ] || { fail "$key=true but host $from is unset"; return 0; } ;;
     *)        path="$val" ;;
   esac
   case "$path" in
@@ -325,7 +327,8 @@ resolve_sock() {
   esac
   if [ ! -S "$path" ]; then
     case "$path" in */podman.sock) warn "start it with: systemctl --user enable --now podman.socket" ;; esac
-    die "$key -> '$path' is not a socket (set false to disable)"
+    fail "$key -> '$path' is not a socket (set false to disable)"
+    return 0
   fi
   printf '%s' "$path"
 }
@@ -335,7 +338,7 @@ else
   engine_sock=unix:///var/run/docker.sock
 fi
 DOCKER_SOCK="$(resolve_sock docker-host "$(tilde "$(cfg docker-host)")" "${DOCKER_HOST:-$engine_sock}" DOCKER_HOST)"
-SSH_AGENT_SOCK="$(resolve_sock ssh-agent "$(tilde "$(cfg ssh-agent)")" "${SSH_AUTH_SOCK:-}" SSH_AUTH_SOCK)"
+SSH_AGENT_SOCK="$(resolve_sock ssh-agent "$(tilde "$(cfg ssh-agent)")" "${SSH_AUTH_SOCK:-}" SSH_AUTH_SOCK 1)"
 
 HOST_UID="$(id -u)"; HOST_GID="$(id -g)"
 # "latest" stays out of the hash: resolving it costs a network call, so only --build does

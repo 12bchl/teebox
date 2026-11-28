@@ -202,7 +202,8 @@ and `--pass-env NAME` add to it.
 ## Host sockets
 
 Off by default. Each is `false`, `true` (inherit the host's), or an explicit
-path. Anything that isn't a live socket fails the run before any build.
+path. Anything that isn't a live socket fails the run before any build, except
+`ssh-agent`: warns and runs without it.
 
 ```toml
 docker-host = true   # $DOCKER_HOST, else /var/run/docker.sock (podman: $XDG_RUNTIME_DIR/podman/podman.sock)

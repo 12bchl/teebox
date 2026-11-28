@@ -91,7 +91,8 @@ source of truth for behaviour.
 - **Two engines** (docker / rootless podman) differ in uid mapping, sockets,
   device groups: every host-integration change covers both.
 - **Host sockets are opt-in** (`false` default, `true` inherits host, or a
-  path); not a live socket = die before the build. Never autodetect on. Socket
+  path); not a live socket = die before the build (`ssh-agent`: warn, run
+  without it). Never autodetect on. Socket
   gid via `--group-add` under docker only (host gids invalid in podman userns).
 - **Host env crosses by name only** (`-e KEY` after `export`): values never in
   engine argv or `--dry-run`. Values come from the `HOST_ENV` snapshot taken at
