@@ -52,6 +52,7 @@ Every setting is both a flag and a key in the [config](#config) file
 | `--ro PATH` | read-only include at `/refs/<basename>` (list) |
 | `-e, --env KEY=VAL` | env var in the box (list) |
 | `--pass-env NAME` | host env var forwarded by name (list) |
+| `--pass-env-add NAME` | like `pass-env`; in the config appends to it instead of replacing (list) |
 | `--add-host NAME:ADDR` | extra `/etc/hosts` entry (list) |
 | `--device DEV` | host device, see [devices](#devices) (list) |
 | `--docker-host[=URL]` | engine socket, see [host sockets](#host-sockets) |
@@ -195,7 +196,8 @@ Also forwarded: `TERM` `COLORTERM` `TERM_PROGRAM` `TERM_PROGRAM_VERSION`
 `GONOPROXY` `GONOSUMDB` `GOINSECURE` (via host `go env`, so `go env -w`
 counts). Never forwarded by default: host paths, binaries, locales, `localhost`
 URLs (`PATH`, `HOME`, `XDG_*`, `GOPATH`, `GOPROXY`, `HTTP(S)_PROXY`, `LANG`, ...).
-`pass-env` in the config replaces the default list; `--pass-env NAME` adds.
+`pass-env` in the config replaces the default list; `pass-env-add` in the config
+and `--pass-env NAME` add to it.
 
 ## Host sockets
 

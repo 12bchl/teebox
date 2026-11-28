@@ -41,7 +41,7 @@ _teebox() {
       --engine)        _teebox_words "$cur" docker podman ;;
       -d|--dir|--home) compopt -o filenames; mapfile -t COMPREPLY < <(compgen -d -- "$cur") ;;
       --ro|--device)   compopt -o filenames; mapfile -t COMPREPLY < <(compgen -f -- "$cur") ;;
-      --pass-env)      mapfile -t COMPREPLY < <(compgen -e -- "$cur") ;;
+      --pass-env|--pass-env-add) mapfile -t COMPREPLY < <(compgen -e -- "$cur") ;;
       *)               COMPREPLY=() ;;
     esac
     return 0

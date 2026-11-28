@@ -19,7 +19,7 @@ _teebox() {
       engine)   action='(docker podman)' ;;
       dir|home) action='_directories' ;;
       ro|device) action='_files' ;;
-      pass-env) action='_parameters -g "*export*"' ;;
+      pass-env|pass-env-add) action='_parameters -g "*export*"' ;;
       *)        action=' ' ;;
     esac
     if [[ -n $value ]]; then

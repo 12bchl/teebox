@@ -35,6 +35,7 @@ to the config list; switches take `--key` or `--key=false`.
   --ro PATH              read-only include at /refs/<basename> (list)
   -e, --env KEY=VAL      env var in the box (list)
   --pass-env NAME        host env var forwarded by name (list)
+  --pass-env-add NAME    like pass-env; config value appends to pass-env instead of replacing (list)
   --add-host NAME:ADDR   extra /etc/hosts entry (list)
   --device DEV           host device present at start: /dev path or bare name (list)
   --docker-host[=URL]    engine socket: host $DOCKER_HOST / engine default, or unix:///path
@@ -68,7 +69,7 @@ CONFIG="$CONFIG_DIR/config.toml"
 TOPICS_FILE="$(xdg_dir "${XDG_STATE_HOME:-}" .local/state)/teebox/topics.tsv"
 
 VALUE_KEYS=" agent engine image name volume home go-version dir "
-LIST_KEYS=" ro env pass-env add-host device "
+LIST_KEYS=" ro env pass-env pass-env-add add-host device "
 SWITCH_KEYS=" docker-host ssh-agent new shell seed build allow-home dry-run topics "
 CLI_ONLY=" dir new shell seed build allow-home dry-run topics "
 AGENT_KEYS=" package version cmd args pass-env env session-new session-resume session-found "
@@ -154,6 +155,7 @@ HOME_SRC="${HOME_SRC:-$CONFIG_DIR/home}"
 cfg_list ro RO_PATHS
 cfg_list env ENV_PAIRS
 cfg_list pass-env PASS_ENV
+cfg_list pass-env-add PASS_ENV_ADD
 cfg_list add-host ADD_HOSTS
 cfg_list device DEVICES
 
@@ -223,7 +225,7 @@ cfg_list "$A.session-resume" AGENT_SESSION_RESUME
 declare -A pass_seen=()
 PASS=()
 GO_PASS=()
-for k in "${PASS_ENV[@]}" "${AGENT_PASS_ENV[@]}"; do
+for k in "${PASS_ENV[@]}" "${PASS_ENV_ADD[@]}" "${AGENT_PASS_ENV[@]}"; do
   [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "pass-env '$k' is not a variable name"
   [ -z "${pass_seen[$k]:-}" ] || continue
   pass_seen[$k]=1

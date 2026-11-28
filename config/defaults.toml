@@ -22,6 +22,7 @@ pass-env = [
   "TZ",
   "GOPRIVATE", "GONOPROXY", "GONOSUMDB", "GOINSECURE",
 ]
+pass-env-add = []                # appended to pass-env: extend the defaults without restating them
 
 # Agents. Placeholders: {id} session uuid, {id8} its first 8 chars, {hex} undashed,
 # {topic}, {workspace}. Args expanding to "" are dropped.
